@@ -63,4 +63,7 @@ Join above conditions together with logical "and":
 
 ...
 
+[?] https://github.com/solodon4/Mach7
+[?] https://github.com/mpark/patterns
+[?] http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2012/n3449.pdf
 

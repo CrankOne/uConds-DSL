@@ -6,6 +6,7 @@
 # include <boost/fusion/include/std_pair.hpp>
 # include <boost/bind.hpp>
 # include <boost/lexical_cast.hpp>
+# include <boost/algorithm/string/trim.hpp>
 
 # include <unordered_map>
 # include <iostream>
@@ -79,39 +80,39 @@ struct ASTPrint : public boost::static_visitor<void> {
     }
 
     void operator()( const std::pair<Predicate, std::string> & p ) {
-        ss << "(LEAF: "
-           << (int) p.first
-           << ", \"" << p.second
+        ss << "(";
+        switch( p.first ) {
+            case unset : ss << '0' ; break;
+            case eq    : ss << '=' ; break;
+            case neq   : ss << '!' ; break;
+            case gt    : ss << '>' ; break;
+            case gte   : ss << ">="; break;
+            case lt    : ss << '<' ; break;
+            case lte   : ss << "<="; break;
+            default: ss << '?'; break;
+        };
+        ss << ", \"" << p.second
            << "\")";
     }
 
     void operator()( const AST & ast ) {
-        ss << "(AST: ";
+        ss << "{ ";
         boost::apply_visitor( *this, ast.expr );
-        ss << ")";
+        ss << " }";
     }
 
     void operator()( const BinOp & bo ) {
-        if( '&' == bo.op ) {
-            ss << "(&: ";
-        } else {
-            std::cout << "(|: ";
-        }
+        ss << "(";
         boost::apply_visitor( *this, bo.left.expr );
-        ss << ", ";
+        if( '&' == bo.op ) {
+            ss << " & ";
+        } else {
+            ss << " | ";
+        }
         boost::apply_visitor( *this, bo.right.expr );
         ss << ")";
     }
 };
-
-/*
-BOOST_FUSION_ADAPT_STRUCT(
-    filtering::BinOp,
-    (std::string, name)
-    (AST, left)
-    (AST, right)
-)
-*/
 
 std::ostream & operator<<(std::ostream & ss, AST ast) {
     ASTPrint astp(ss);
@@ -126,17 +127,10 @@ std::ostream & operator<<(std::ostream & ss, AST ast) {
 template<typename SubjectT>
 struct Traits {
     typedef SubjectT Subject;
-
     /// Abstract base for filter objects.
-    struct Base {
-        virtual bool check( Subject ) const = 0;
-    };
-
+    struct Base { virtual bool check( Subject ) const = 0; };
     /// Base for binary filter objects (AND/OR nodes).
-    struct BinOp : public Base {
-        Base * left, * right;
-    };
-
+    struct BinOp : public Base { Base * left, * right; };
     /// Logical AND concatenation for two filtering objects. Computes right
     /// operand only if left is TRUE.
     struct And : public BinOp {
@@ -148,7 +142,6 @@ struct Traits {
             return true;
         }
     };
-
     /// Logical OR concatenation for two filtering objects. Computes right
     /// operand only if left is FALSE.
     struct Or : public BinOp {
@@ -161,23 +154,23 @@ struct Traits {
         }
     };
 
-    # if 1
+    /// Common base for parameterized filters capable to parse arbitrary
+    /// sub-expressions.
     template<typename ValueT>
     class Parameterized : public Base {
     public:
+        enum BinOpType { AND_, OR_ };
         typedef ValueT Value;
-        struct ConcatAND;
-        struct ConcatOR;
+        template<BinOpType> struct BinaryOperator;
         struct Leaf;
         /// Represents comparison pattern (e.g. >=100, !=0, etc.).
         struct DecisionTree {
             /// Represents constructed decision tree node. 
             typedef boost::variant< Nil
-                , bool
                 , Leaf
-                , boost::recursive_wrapper<ConcatAND>
-                , boost::recursive_wrapper<ConcatOR>
-                , boost::recursive_wrapper<DecisionTree>
+                , boost::recursive_wrapper< BinaryOperator<AND_> >
+                , boost::recursive_wrapper< BinaryOperator<OR_> >
+                , boost::recursive_wrapper< DecisionTree >
                 > DecisionTreeBranch;
             DecisionTreeBranch root;
             DecisionTree( const DecisionTreeBranch & r ) : root(r) {}
@@ -190,15 +183,40 @@ struct Traits {
             bool (*comparator)( Value l, Value r );
         };
         /// Binary operator node: AND/OR for subseq. nodes.
-        struct BinaryLConcat {
-            DecisionTree l, r;
+        template<BinOpType BOT> struct BinaryOperator {
+            typename DecisionTree::DecisionTreeBranch l, r;
         };
-        /// Binary conditions AND-concationation.
-        struct ConcatAND : public BinaryLConcat {};
-        /// Binary conditions OR-concationation.
-        struct ConcatOR : public BinaryLConcat {};
+        typedef BinaryOperator<AND_> AND;
+        typedef BinaryOperator<OR_> OR;
     private:
         DecisionTree dt;
+    public:
+        /// Condition printing recursive visitor struct.
+        struct PrintingVisitor {
+            std::ostream & ss;
+            PrintingVisitor( std::ostream & ss_ ) : ss(ss_) {}
+            void operator()( Nil ) const { ss << "(Nil)"; }
+            void operator()( const Leaf & l ) const {
+                ss << "(" << (void *) l.comparator << ", " << l.pattern << ")";
+            }
+            void operator()( const BinaryOperator<AND_> & and_ ) const {
+                ss << "(";
+                boost::apply_visitor(*this, and_.l);
+                ss << "&";
+                boost::apply_visitor(*this, and_.r);
+                ss << ")";
+            }
+            void operator()( const BinaryOperator<OR_> & or_ ) const {
+                ss << "(";
+                boost::apply_visitor(*this, or_.l);
+                ss << "|";
+                boost::apply_visitor(*this, or_.r);
+                ss << ")";
+            }
+            void operator()( DecisionTree dt ) const {
+                return boost::apply_visitor( *this, dt.root );
+            }
+        };
         /// Condition evaluator recursive visitor struct.
         struct EvaluationVisitor {
             typedef bool result_type;
@@ -210,21 +228,21 @@ struct Traits {
                 assert(l.comparator);
                 return l.comparator( val, l.pattern );
             }
-            bool operator()( const ConcatAND & and_ ) const {
-                if( !boost::apply_visitor(*this, and_.l.root) ) return false;
-                if( !boost::apply_visitor(*this, and_.r.root) ) return false;
+            bool operator()( const BinaryOperator<AND_> & and_ ) const {
+                if( !boost::apply_visitor(*this, and_.l) ) return false;
+                if( !boost::apply_visitor(*this, and_.r) ) return false;
                 return true;
             }
-            bool operator()( const ConcatOR & or_ ) const {
-                if( boost::apply_visitor(*this, or_.l.root) ) return true;
-                if( boost::apply_visitor(*this, or_.r.root) ) return true;
+            bool operator()( const BinaryOperator<OR_> & or_ ) const {
+                if( boost::apply_visitor(*this, or_.l) ) return true;
+                if( boost::apply_visitor(*this, or_.r) ) return true;
                 return false;
             }
             bool operator()( DecisionTree dt ) const {
                 return boost::apply_visitor( *this, dt.root );
             }
         };
-    public:
+
         Parameterized( DecisionTree dt_ ) : dt(dt_) {}
         /// Evaluates expression.
         bool check( Subject s ) const override {
@@ -234,38 +252,13 @@ struct Traits {
         /// Must compute value from given subject instance.
         virtual Value compute( Subject s ) const = 0;
     };
-    # else
-    /// Single parameterized filter base.
-    class Parameterized : public Base {
-    public:
-        const Predicate predicate;
-    private:
-        mutable void * _cache;
-    protected:
-        Parameterized() : predicate( unset ) {}
-    public:
-        Parameterized( Predicate p ) : predicate(p) {}
-
-        /// Overriden to support the caching mechanism.
-        bool check( Subject s ) const final {
-            cache( s, _cache );
-            bool rs = check_cached( s, _cache );
-            clear_cache( _cache );
-        }
-
-        /// May use cache information as supplementary context.
-        virtual bool check_cached( Subject s, void * cache ) const = 0;
-        /// Shall allocate the cache when need.
-        virtual void cache( Subject s, void *& ) const { ; }
-        /// Shall free the cache when need.
-        virtual void clear_cache( void *& ) const { ; }
-    };
-    # endif
 
     /// Filter construction callback.
     typedef typename Traits::Base * (*FilterConstructor)( const AST & );
     /// Factory method for ctring the filters.
-    static Base * produce( const std::string, const AST & );
+    static Base * produce( const std::string
+                         , const AST &
+                         , std::ostream * logStream=nullptr );
     /// Returns named filter ctr or NULL.
     static FilterConstructor constructor( const std::string );
     /// Helper method performing AST treatment during ctrion of new filter instance.
@@ -308,7 +301,8 @@ Traits<T>::constructor( const std::string name ) {
 template<typename T>
 typename Traits<T>::Base *
 Traits<T>::produce( const std::string name
-                  , const AST & ast ) {
+                  , const AST & ast
+                  , std::ostream * ssPtr ) {
     assert(_constructors);
     auto ctr = Traits<T>::constructor(name);
     if( nullptr == ctr ) {
@@ -316,11 +310,16 @@ Traits<T>::produce( const std::string name
                 + name
                 + "\" is registered." );
     }
-    std::cout << "The " << (void *) ctr << " will construct \""
-              << name << "\" instance w/ parameters: "
-              << ast << std::endl;
+    if( ssPtr ) {
+        *ssPtr << "The " << (void *) ctr << " will construct \""
+               << name << "\" instance w/ parameters: "
+               << ast << std::endl;
+    }
     return Traits<T>::construct(ctr, ast);
 }
+
+// Comparison traits
+// ////////////////
 
 template<typename T>
 struct ComparisonTraits {
@@ -345,12 +344,9 @@ struct ComparisonTraits {
 };
 
 template<typename T> bool (*ComparisonTraits<T>::cmpPtrs[7])(T, T) = {
-        ComparisonTraits::eq,
-        ComparisonTraits::neq,
-        ComparisonTraits::gt,
-        ComparisonTraits::gte,
-        ComparisonTraits::lt,
-        ComparisonTraits::lte
+        ComparisonTraits::eq,   ComparisonTraits::neq,
+        ComparisonTraits::gt,   ComparisonTraits::gte,
+        ComparisonTraits::lt,   ComparisonTraits::lte
     };
 
 namespace aux {
@@ -358,7 +354,7 @@ namespace aux {
 template< typename T
         , typename ValueT
         , typename ValueParserT>
-class ConstructingVisitor /*: public boost::static_visitor<typename Traits<T>::Base *>*/ {
+class ConstructingVisitor : public boost::static_visitor<typename Traits<T>::Base *> {
 public:
     typedef Traits<T> FT;
     typedef typename FT::template Parameterized<ValueT>
@@ -375,6 +371,9 @@ public:
     }
 
     result_type operator()( const std::pair<Predicate, std::string> & p ) {
+        // NOTE: trimming here may be an overkill (would it be better to tune
+        // our lexer instead?)
+        //boost::algorithm::trim_copy(p.second);
         return _vParse( p.first, p.second );
     }
 
@@ -382,17 +381,19 @@ public:
         return boost::apply_visitor(*this, ast.expr);
     }
 
-    result_type operator()( const typename FT::BinOp & bo ) {
+    result_type operator()( const BinOp & bo ) {
+        typedef typename FT::template Parameterized<ValueT>::AND AND;
+        typedef typename FT::template Parameterized<ValueT>::OR OR;
         if( '&' == bo.op ) {
-            return ConcatAND( boost::apply_visitor( *this, bo.left )
-                            , boost::apply_visitor( *this, bo.right ) );
+            return AND{ boost::apply_visitor( *this, bo.left.expr )
+                      , boost::apply_visitor( *this, bo.right.expr ) };
         } else {
-            return ConcatOR(  boost::apply_visitor( *this, bo.left )
-                            , boost::apply_visitor( *this, bo.right ) );
+            return OR{ boost::apply_visitor( *this, bo.left.expr )
+                     , boost::apply_visitor( *this, bo.right.expr ) };
         }
     }
 };
-}
+}  // namespace aux
 
 template<typename T>
 typename Traits<T>::Base *
@@ -402,6 +403,9 @@ Traits<T>::construct( FilterConstructor ctr, const AST & ast ) {
 }
 
 }  // namespace filtering
+
+// Parsing routines
+// ///////////////
 
 namespace client {
 
@@ -416,8 +420,8 @@ struct CtxFilter : qi::grammar< ItT
                               , typename filtering::Traits<T>::Base *
                               , ascii::space_type > {
 
-
-    CtxFilter() : CtxFilter::base_type(filters) {
+    CtxFilter( std::ostream * logStr_=nullptr ) : CtxFilter::base_type(filters)
+                                                , logStr(logStr_) {
         using qi::char_;
         using ascii::string;
         using qi::lit;
@@ -433,7 +437,7 @@ struct CtxFilter : qi::grammar< ItT
                 )
             ;
 
-        filter = (label >> char_(':') >> expressions)[phx::bind(&FT::produce, qi::_1, qi::_3)]
+        filter = (label >> char_(':') >> expressions)[phx::bind(&FT::produce, qi::_1, qi::_3, logStr)]
             ;
 
         expressions = expression[_val = qi::_1]
@@ -469,6 +473,8 @@ struct CtxFilter : qi::grammar< ItT
         BOOST_SPIRIT_DEBUG_NODE(ctrParameter);
     }
 
+    std::ostream * logStr;
+
     qi::rule< ItT
             , typename filtering::Traits<T>::Base *
             , ascii::space_type
@@ -496,35 +502,19 @@ private:
     } predicate_;
 };
 
-/*
-BOOST_FUSION_ADAPT_STRUCT(
-    BinOp,
-    (AST, left)
-    (char, op)
-    (AST, right)
-)
-*/
-
 }
 
 // Define SomeContext mock ctx struct and couple filters for it.
+struct SomeContext { int a, b; };
 
-struct SomeContext {  // xxx
-    int a, b;
-};
-
+/// Filter for mock context's "a" attribute
 class AComparator : public filtering::Traits<SomeContext>::Parameterized<int> {
 public:
     /// Own filtering traits type alias.
     typedef filtering::Traits<SomeContext> FT;
-
     typedef typename FT::Parameterized<int> Parent;
-
-    /// Acquires "a" value from SomeContext.
-    int compute( SomeContext ctx ) const override {
-        return ctx.a;
-    }
-
+    /// (interface implem) Acquires "a" value from SomeContext.
+    int compute( SomeContext ctx ) const override { return ctx.a; }
     /// Virtual ctr function.
     static typename FT::Base * vctr( const filtering::AST & ast );
 private:
@@ -538,25 +528,49 @@ AComparator::vctr( const filtering::AST & ast ) {
         , int
         , decltype(filtering::ComparisonTraits<int>::parse<SomeContext>) *>
         cv(filtering::ComparisonTraits<int>::parse<SomeContext>);
-    std::cout << "Applying visitor to (.which()=";  // xxx
-    std::cout << ast.expr.which() << "):\n";  // xxx
     auto dt = boost::apply_visitor( cv, ast.expr );
+    {
+        Parent::PrintingVisitor pv( std::cout );  // XXX
+        boost::apply_visitor( pv, dt );  // XXX
+        std::cout << std::endl;
+    }
     return new AComparator( dt );
+}
+
+/// Filter for mock context's "b" attribute.
+class BComparator : public filtering::Traits<SomeContext>::Parameterized<int> {
+public:
+    /// Own filtering traits type alias.
+    typedef filtering::Traits<SomeContext> FT;
+    typedef typename FT::Parameterized<int> Parent;
+    /// (interface implem) Acquires "a" value from SomeContext.
+    int compute( SomeContext ctx ) const override { return ctx.b; }
+    /// Virtual ctr function.
+    static typename FT::Base * vctr( const filtering::AST & ast );
+private:
+    /// Own ctr, available to vctr only.
+    BComparator( DecisionTree dt ) : Parent( dt ) {}
+};
+
+typename BComparator::FT::Base *
+BComparator::vctr( const filtering::AST & ast ) {
+    filtering::aux::ConstructingVisitor< SomeContext
+        , int
+        , decltype(filtering::ComparisonTraits<int>::parse<SomeContext>) *>
+        cv(filtering::ComparisonTraits<int>::parse<SomeContext>);
+    auto dt = boost::apply_visitor( cv, ast.expr );
+    return new BComparator( dt );
 }
 
 int
 main( int argc, char * const argv[] ) {
     filtering::Traits<SomeContext>::register_constructor("a", AComparator::vctr);
+    filtering::Traits<SomeContext>::register_constructor("b", BComparator::vctr);
 
-    std::cout << "Expression parser...\n\n";
-    std::cout << "Type an expression...or [q or Q] to quit\n\n";
+    std::cout << "Type an expression or [q or Q] to quit:\n";
 
-    using boost::spirit::ascii::space;
-    using boost::spirit::utree;
-    typedef std::string::const_iterator iterator_type;
-    typedef client::CtxFilter<iterator_type, SomeContext> CtxFilter;
-
-    CtxFilter ctxFilter; // Our grammar
+    client::CtxFilter< std::string::const_iterator
+                     , SomeContext> ctxFilter( &std::cout );
 
     std::string str;
     while (std::getline(std::cin, str)) {
@@ -565,18 +579,18 @@ main( int argc, char * const argv[] ) {
 
         std::string::const_iterator iter = str.begin();
         std::string::const_iterator end = str.end();
-        bool r = phrase_parse(iter, end, ctxFilter, space);
+        bool r = phrase_parse(iter, end, ctxFilter, boost::spirit::ascii::space);
 
-        if (r && iter == end) {
-            std::cout << "Parsing succeeded: " /*<< ut*/ << std::endl;
+        if( r && end == iter ) {
+            std::cout << "ok." << std::endl;
         } else {
             std::string rest(iter, end);
-            std::cout << "Parsing failed\n";
-            std::cout << "stopped at: \": " << rest << "\"" << std::endl;
+            std::cerr << "Failed. Stopped at: \": "
+                      << rest
+                      << "\"" << std::endl;
         }
     }
-
-    std::cout << "Bye." << std::endl;
+    std::cout << "Done." << std::endl;
     return 0;
 }
 
