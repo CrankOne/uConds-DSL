@@ -7,6 +7,7 @@
 # include <boost/bind.hpp>
 # include <boost/lexical_cast.hpp>
 # include <boost/algorithm/string/trim.hpp>
+# include <boost/move/unique_ptr.hpp>
 
 # include <unordered_map>
 # include <iostream>
@@ -23,100 +24,146 @@ enum Predicate { unset = 0x0
     , lt  = 0x5, lte = 0x6
 };
 
-struct BinOp;
-struct AST;
+enum BinOpType { AND_, OR_ };
+
 struct Nil {};
 
-///@brief Represents filtering expression for single type.
-///
-/// Parser builds the abstract syntax tree to represent logic conditions
-/// related to the single subject. For instance, the `length:>100cm&<200cm'
-/// will have an AST: ( &, (>, '100cm'), (<, '200cm') ).
-struct AST {
-    typedef boost::variant< Nil  // should never be
-        , std::pair<Predicate, std::string>  // leaf expr node
-        , boost::recursive_wrapper<AST>  // for left,right of BinOp
-        , boost::recursive_wrapper<BinOp>
-        > type;
+template<typename LeafT>
+struct ExpressionTree {
+    typedef LeafT Leaf;
+    template<BinOpType> struct BinaryOperator;  // fwd
+    typedef boost::variant< Nil
+        , Leaf  // leaf expr node
+        , boost::recursive_wrapper< BinaryOperator<AND_> >
+        , boost::recursive_wrapper< BinaryOperator<OR_> >
+        , boost::recursive_wrapper< ExpressionTree >
+        > Branch;
 
-    AST & operator&=(const AST & rhs);
-    AST & operator|=(const AST & rhs);
+    ExpressionTree & operator&=( const ExpressionTree & );
+    ExpressionTree & operator|=( const ExpressionTree & );
 
-    AST( ) : expr(Nil()) {}
-    AST( const AST & o ) : expr(o.expr) {}
-    template<typename Expr> AST(const Expr & expr_) : expr(expr_) {}
+    /// Binary operator node: AND/OR for subseq. nodes.
+    template<BinOpType BOT> struct BinaryOperator {
+        ExpressionTree l, r;
+    };
 
-    type expr;
+    Branch root;
+
+    template<typename T> ExpressionTree( const T & root_ ) : root(root_) {}
+    ExpressionTree() : root(Nil()) {}
+
+    typedef BinaryOperator<AND_> AND;
+    typedef BinaryOperator<OR_> OR;
+    typedef Branch type;  // xxx?
 };
 
-struct BinOp {
-    BinOp( char op
-         , const AST & left
-         , const AST & right)
-    : op(op), left(left), right(right) {}
-
-    char op;
-    AST left, right;
-};
-
-AST &
-AST::operator&=( const AST & rhs) {
-    expr = BinOp('&', expr, rhs);
+template<typename LeafT> ExpressionTree<LeafT> &
+ExpressionTree<LeafT>::operator&=( const ExpressionTree<LeafT> & r ) {
+    root = AND{ *this, r };
     return *this;
 }
 
-AST &
-AST::operator|=( const AST & rhs ) {
-    expr = BinOp('|', expr, rhs);
+template<typename LeafT> ExpressionTree<LeafT> &
+ExpressionTree<LeafT>::operator|=( const ExpressionTree<LeafT> & r ) {
+    root = OR{ *this, r };
     return *this;
 }
 
-struct ASTPrint : public boost::static_visitor<void> {
+// Specialize this template to print leaf of certain type.
+template<typename LeafT>
+struct LeafPrintingTraits {
+    static void print_leaf( const LeafT & l, std::ostream & os) { os << l; }
+};
+
+template< typename LeafT>
+struct LeafEvalTraits {
+    typedef typename LeafT::Value Value;
+    typedef typename LeafT::Result Result;
+    static Result eval_leaf( const LeafT & l
+                           , const Value & v ) {
+        return l( v );
+    }
+    //static Result eval_and( const Tree<LeafT> & l ) {
+    // ...?
+    //}
+};
+
+template<typename LeafT>
+struct ExprTreePrintingVisitor : public boost::static_visitor<void> {
+    typedef ExpressionTree<LeafT> Tree;
+
     std::ostream & ss;
-    ASTPrint( std::ostream & ss_ ) : ss(ss_) {}
+    ExprTreePrintingVisitor( std::ostream & ss_ ) : ss(ss_) {}
 
     void operator()( const Nil & p ) {
         ss << "(Nil)";
     }
 
-    void operator()( const std::pair<Predicate, std::string> & p ) {
-        ss << "(";
-        switch( p.first ) {
-            case unset : ss << '0' ; break;
-            case eq    : ss << '=' ; break;
-            case neq   : ss << '!' ; break;
-            case gt    : ss << '>' ; break;
-            case gte   : ss << ">="; break;
-            case lt    : ss << '<' ; break;
-            case lte   : ss << "<="; break;
-            default: ss << '?'; break;
-        };
-        ss << ", \"" << p.second
-           << "\")";
+    void operator()( const LeafT & leaf ) {
+        LeafPrintingTraits<LeafT>::print_leaf( leaf, ss );
     }
 
-    void operator()( const AST & ast ) {
+    void operator()( const Tree & ast ) {
         ss << "{ ";
-        boost::apply_visitor( *this, ast.expr );
+        boost::apply_visitor( *this, ast.root );
         ss << " }";
     }
 
-    void operator()( const BinOp & bo ) {
+    void operator()( const typename Tree::template BinaryOperator<AND_> & bo ) {
         ss << "(";
-        boost::apply_visitor( *this, bo.left.expr );
-        if( '&' == bo.op ) {
-            ss << " & ";
-        } else {
-            ss << " | ";
-        }
-        boost::apply_visitor( *this, bo.right.expr );
+        boost::apply_visitor( *this, bo.l.root );
+        ss << " & ";
+        boost::apply_visitor( *this, bo.r.root );
+        ss << ")";
+    }
+
+    void operator()( const typename Tree::template BinaryOperator<OR_> & bo ) {
+        ss << "(";
+        boost::apply_visitor( *this, bo.l.root );
+        ss << " & ";
+        boost::apply_visitor( *this, bo.r.root );
         ss << ")";
     }
 };
 
+/// Condition evaluator recursive visitor struct.
+template< typename LeafT >
+struct ExpressionEvaluationVisitor : public boost::static_visitor<typename LeafT::Result> {
+    typedef LeafT Leaf;
+    typedef ExpressionTree<Leaf> Tree;
+    typedef typename LeafEvalTraits<Leaf>::Value Value;
+    typedef typename LeafEvalTraits<Leaf>::Result Result;
+
+    Value val;
+
+    ExpressionEvaluationVisitor( Value v ) : val(v) {}
+
+    Result operator()( Nil ) const { assert(false); }
+    Result operator()( const Leaf & l ) const {
+        return LeafEvalTraits<Leaf>::eval_leaf( l, val );
+    }
+    Result operator()( const typename Tree::template BinaryOperator<AND_> & and_ ) const {
+        if( !boost::apply_visitor(*this, and_.l.root) ) return false;
+        if( !boost::apply_visitor(*this, and_.r.root) ) return false;
+        return true;
+    }
+    Result operator()( const typename Tree::template BinaryOperator<OR_> & or_ ) const {
+        if( boost::apply_visitor(*this, or_.l.root) ) return true;
+        if( boost::apply_visitor(*this, or_.r.root) ) return true;
+        return false;
+    }
+    Result operator()( const Tree & dt ) const {
+        return boost::apply_visitor( *this, dt.root );
+    }
+};
+
+/// AST for interim representation of single-typed values
+/// (expressions in "<label> : <expr>" pairs).
+typedef ExpressionTree<std::pair<Predicate, std::string> > AST;
+
 std::ostream & operator<<(std::ostream & ss, AST ast) {
-    ASTPrint astp(ss);
-    boost::apply_visitor( astp, ast.expr );
+    ExprTreePrintingVisitor<typename AST::Leaf> astp(ss);
+    boost::apply_visitor( astp, ast.root );
     return ss;
 }
 
@@ -129,30 +176,10 @@ struct Traits {
     typedef SubjectT Subject;
     /// Abstract base for filter objects.
     struct Base { virtual bool check( Subject ) const = 0; };
-    /// Base for binary filter objects (AND/OR nodes).
-    struct BinOp : public Base { Base * left, * right; };
-    /// Logical AND concatenation for two filtering objects. Computes right
-    /// operand only if left is TRUE.
-    struct And : public BinOp {
-        bool check( Subject s ) const final {
-            assert(this->left);
-            assert(this->right);
-            if( !this->left->check(s) ) return false;
-            if( !this->right->check(s) ) return false;
-            return true;
-        }
-    };
-    /// Logical OR concatenation for two filtering objects. Computes right
-    /// operand only if left is FALSE.
-    struct Or : public BinOp {
-        bool check( Subject s ) const final {
-            assert(this->left);
-            assert(this->right);
-            if( this->left->check(s) ) return true;
-            if( this->right->check(s) ) return true;
-            return false;
-        }
-    };
+
+    typedef std::shared_ptr<Base> NodeRef;
+
+    typedef ExpressionTree< NodeRef > Tree;
 
     /// Common base for parameterized filters capable to parse arbitrary
     /// sub-expressions.
@@ -162,91 +189,37 @@ struct Traits {
         enum BinOpType { AND_, OR_ };
         typedef ValueT Value;
         template<BinOpType> struct BinaryOperator;
-        struct Leaf;
-        /// Represents comparison pattern (e.g. >=100, !=0, etc.).
-        struct DecisionTree {
-            /// Represents constructed decision tree node. 
-            typedef boost::variant< Nil
-                , Leaf
-                , boost::recursive_wrapper< BinaryOperator<AND_> >
-                , boost::recursive_wrapper< BinaryOperator<OR_> >
-                , boost::recursive_wrapper< DecisionTree >
-                > DecisionTreeBranch;
-            DecisionTreeBranch root;
-            DecisionTree( const DecisionTreeBranch & r ) : root(r) {}
-        };
         /// Leaf node -- performs user-defined comparison w.r.t. predicate.
         struct Leaf {
+            typedef ValueT Value;
+            typedef bool Result;
+
             /// Keeps ctrd pattern to match. Must be trivially ctrble.
             Value pattern;
             /// Ptr to comparator function
-            bool (*comparator)( Value l, Value r );
+            Result (*comparator)( Value l, Value r );
+
+            Result operator()( const Value & v ) const {
+                assert(comparator);
+                return comparator( v, pattern );
+            }
+
+            friend std::ostream & operator<<( std::ostream & os, const Leaf & l ) {
+                return os << "[" << (void *) l.comparator
+                          << ", " << l.pattern
+                          << "]";
+            }
         };
-        /// Binary operator node: AND/OR for subseq. nodes.
-        template<BinOpType BOT> struct BinaryOperator {
-            typename DecisionTree::DecisionTreeBranch l, r;
-        };
-        typedef BinaryOperator<AND_> AND;
-        typedef BinaryOperator<OR_> OR;
+        /// Represents comparison pattern (e.g. >=100, !=0, etc.).
+        typedef ExpressionTree<Leaf> DecisionTree;
     private:
         DecisionTree dt;
     public:
-        /// Condition printing recursive visitor struct.
-        struct PrintingVisitor {
-            std::ostream & ss;
-            PrintingVisitor( std::ostream & ss_ ) : ss(ss_) {}
-            void operator()( Nil ) const { ss << "(Nil)"; }
-            void operator()( const Leaf & l ) const {
-                ss << "(" << (void *) l.comparator << ", " << l.pattern << ")";
-            }
-            void operator()( const BinaryOperator<AND_> & and_ ) const {
-                ss << "(";
-                boost::apply_visitor(*this, and_.l);
-                ss << "&";
-                boost::apply_visitor(*this, and_.r);
-                ss << ")";
-            }
-            void operator()( const BinaryOperator<OR_> & or_ ) const {
-                ss << "(";
-                boost::apply_visitor(*this, or_.l);
-                ss << "|";
-                boost::apply_visitor(*this, or_.r);
-                ss << ")";
-            }
-            void operator()( DecisionTree dt ) const {
-                return boost::apply_visitor( *this, dt.root );
-            }
-        };
-        /// Condition evaluator recursive visitor struct.
-        struct EvaluationVisitor {
-            typedef bool result_type;
-            Value val;
-            EvaluationVisitor( Value v ) : val(v) {}
-            bool operator()( Nil ) const { assert(false); }
-            bool operator()( bool v ) const { return v; }
-            bool operator()( const Leaf & l ) const {
-                assert(l.comparator);
-                return l.comparator( val, l.pattern );
-            }
-            bool operator()( const BinaryOperator<AND_> & and_ ) const {
-                if( !boost::apply_visitor(*this, and_.l) ) return false;
-                if( !boost::apply_visitor(*this, and_.r) ) return false;
-                return true;
-            }
-            bool operator()( const BinaryOperator<OR_> & or_ ) const {
-                if( boost::apply_visitor(*this, or_.l) ) return true;
-                if( boost::apply_visitor(*this, or_.r) ) return true;
-                return false;
-            }
-            bool operator()( DecisionTree dt ) const {
-                return boost::apply_visitor( *this, dt.root );
-            }
-        };
-
         Parameterized( DecisionTree dt_ ) : dt(dt_) {}
         /// Evaluates expression.
         bool check( Subject s ) const override {
-            EvaluationVisitor v(compute( s ));
+            ExpressionEvaluationVisitor<Leaf> v(compute( s ));
+            //return boost::apply_visitor(v, dt.root);
             return v(dt.root);
         }
         /// Must compute value from given subject instance.
@@ -255,14 +228,18 @@ struct Traits {
 
     /// Filter construction callback.
     typedef typename Traits::Base * (*FilterConstructor)( const AST & );
+
     /// Factory method for ctring the filters.
     static Base * produce( const std::string
                          , const AST &
                          , std::ostream * logStream=nullptr );
+
     /// Returns named filter ctr or NULL.
     static FilterConstructor constructor( const std::string );
+
     /// Helper method performing AST treatment during ctrion of new filter instance.
     static Base * construct( FilterConstructor, const AST & );
+
     /// Registers new ctr making it available within the parsing routines.
     static void register_constructor( const char *, FilterConstructor );
 private:
@@ -359,7 +336,7 @@ public:
     typedef Traits<T> FT;
     typedef typename FT::template Parameterized<ValueT>
                        ::DecisionTree
-                       ::DecisionTreeBranch result_type;
+                       ::Branch result_type;
 private:
     /// Must support operator() and return obj of type Leaf
     ValueParserT _vParse;
@@ -378,19 +355,19 @@ public:
     }
 
     result_type operator()( const AST & ast ) {
-        return boost::apply_visitor(*this, ast.expr);
+        return boost::apply_visitor(*this, ast.root);
     }
 
-    result_type operator()( const BinOp & bo ) {
-        typedef typename FT::template Parameterized<ValueT>::AND AND;
-        typedef typename FT::template Parameterized<ValueT>::OR OR;
-        if( '&' == bo.op ) {
-            return AND{ boost::apply_visitor( *this, bo.left.expr )
-                      , boost::apply_visitor( *this, bo.right.expr ) };
-        } else {
-            return OR{ boost::apply_visitor( *this, bo.left.expr )
-                     , boost::apply_visitor( *this, bo.right.expr ) };
-        }
+    result_type operator()( const typename AST::AND & bo ) {
+        typedef typename FT::template Parameterized<ValueT>::DecisionTree::AND AND;
+        return AND{ boost::apply_visitor( *this, bo.l.root )
+                  , boost::apply_visitor( *this, bo.r.root ) };
+    }
+
+    result_type operator()( const typename AST::OR & bo ) {
+        typedef typename FT::template Parameterized<ValueT>::DecisionTree::OR OR;
+        return OR{ boost::apply_visitor( *this, bo.l.root )
+                 , boost::apply_visitor( *this, bo.r.root ) };
     }
 };
 }  // namespace aux
@@ -417,7 +394,7 @@ namespace phx = boost::phoenix;
 template< typename ItT
         , typename T>
 struct CtxFilter : qi::grammar< ItT
-                              , typename filtering::Traits<T>::Base *
+                              , typename filtering::Traits<T>::Tree
                               , ascii::space_type > {
 
     CtxFilter( std::ostream * logStr_=nullptr ) : CtxFilter::base_type(filters)
@@ -431,9 +408,9 @@ struct CtxFilter : qi::grammar< ItT
         typedef filtering::Traits<T> FT;
 
         filters =
-            filter
-            >> -( ( lit("&&") >> filter )  // TODO: generate filtering expr here
-                | ( lit("||") >> filter )  // TODO: generate filtering expr here
+            filter[_val = qi::_1]
+            >> -( ( lit("&&") >> filter )[ _val |= qi::_1 ]
+                | ( lit("||") >> filter )[ _val |= qi::_1 ]
                 )
             ;
 
@@ -476,9 +453,13 @@ struct CtxFilter : qi::grammar< ItT
     std::ostream * logStr;
 
     qi::rule< ItT
-            , typename filtering::Traits<T>::Base *
+            , typename filtering::Traits<T>::Tree
             , ascii::space_type
-            > filters, filter;
+            > filters;
+    qi::rule< ItT
+            , typename filtering::Traits<T>::NodeRef
+            , ascii::space_type
+            > filter;
     qi::rule< ItT
             , filtering::AST()
             , ascii::space_type> expression, expressions;
@@ -502,7 +483,30 @@ private:
     } predicate_;
 };
 
+}  // namespace client
+
+namespace filtering {
+template<> void
+LeafPrintingTraits< typename AST::Leaf >::print_leaf( const typename AST::Leaf & p
+                                                    , std::ostream & ss ) {
+    ss << "(";
+    switch( p.first ) {
+        case unset : ss << '0' ; break;
+        case eq    : ss << '=' ; break;
+        case neq   : ss << '!' ; break;
+        case gt    : ss << '>' ; break;
+        case gte   : ss << ">="; break;
+        case lt    : ss << '<' ; break;
+        case lte   : ss << "<="; break;
+        default: ss << '?'; break;
+    };
+    ss << ", \"" << p.second
+       << "\")";
 }
+
+}  // namespace filtering
+
+// ////////////////////// ////////////////////// //////////////////////// /////
 
 // Define SomeContext mock ctx struct and couple filters for it.
 struct SomeContext { int a, b; };
@@ -528,9 +532,12 @@ AComparator::vctr( const filtering::AST & ast ) {
         , int
         , decltype(filtering::ComparisonTraits<int>::parse<SomeContext>) *>
         cv(filtering::ComparisonTraits<int>::parse<SomeContext>);
-    auto dt = boost::apply_visitor( cv, ast.expr );
+    auto dt = boost::apply_visitor( cv, ast.root );
     {
-        Parent::PrintingVisitor pv( std::cout );  // XXX
+        filtering::ExprTreePrintingVisitor<
+                typename filtering::Traits<SomeContext>::template Parameterized<int>::Leaf  // Parent::Leaf
+                >
+            pv( std::cout );  // XXX
         boost::apply_visitor( pv, dt );  // XXX
         std::cout << std::endl;
     }
@@ -558,7 +565,7 @@ BComparator::vctr( const filtering::AST & ast ) {
         , int
         , decltype(filtering::ComparisonTraits<int>::parse<SomeContext>) *>
         cv(filtering::ComparisonTraits<int>::parse<SomeContext>);
-    auto dt = boost::apply_visitor( cv, ast.expr );
+    auto dt = boost::apply_visitor( cv, ast.root );
     return new BComparator( dt );
 }
 
