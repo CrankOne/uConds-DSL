@@ -1,5 +1,9 @@
+//# define BOOST_RESULT_OF_USE_DECLTYPE
+//# define BOOST_SPIRIT_USE_PHOENIX_V3
+
 # include <boost/config/warning_disable.hpp>
 # include <boost/spirit/include/qi.hpp>
+# include <boost/spirit/include/phoenix.hpp>
 # include <boost/spirit/include/phoenix_operator.hpp>
 # include <boost/phoenix/bind/bind_function.hpp>
 # include <boost/phoenix/object/construct.hpp>
@@ -27,6 +31,24 @@ enum Predicate { unset = 0x0
 enum BinOpType { AND_, OR_ };
 
 struct Nil {};
+
+std::ostream & operator<<(std::ostream & ss, const Nil & ast) {
+    ss << "(nil)";
+    return ss;
+}
+
+template< typename LeafT >
+struct LeafEvalTraits {
+    typedef typename LeafT::Value Value;
+    typedef typename LeafT::Result Result;
+    static Result eval_leaf( const LeafT & l
+                           , const Value & v ) {
+        return l( v );
+    }
+    //static Result eval_and( const Tree<LeafT> & l ) {
+    // ...?
+    //}
+};
 
 template<typename LeafT>
 struct ExpressionTree {
@@ -72,20 +94,7 @@ ExpressionTree<LeafT>::operator|=( const ExpressionTree<LeafT> & r ) {
 // Specialize this template to print leaf of certain type.
 template<typename LeafT>
 struct LeafPrintingTraits {
-    static void print_leaf( const LeafT & l, std::ostream & os) { os << l; }
-};
-
-template< typename LeafT>
-struct LeafEvalTraits {
-    typedef typename LeafT::Value Value;
-    typedef typename LeafT::Result Result;
-    static Result eval_leaf( const LeafT & l
-                           , const Value & v ) {
-        return l( v );
-    }
-    //static Result eval_and( const Tree<LeafT> & l ) {
-    // ...?
-    //}
+    static void print_leaf( const LeafT & l, std::ostream & os) { os << "[" << l << "]"; }
 };
 
 template<typename LeafT>
@@ -112,7 +121,7 @@ struct ExprTreePrintingVisitor : public boost::static_visitor<void> {
     void operator()( const typename Tree::template BinaryOperator<AND_> & bo ) {
         ss << "(";
         boost::apply_visitor( *this, bo.l.root );
-        ss << " & ";
+        ss << " and ";
         boost::apply_visitor( *this, bo.r.root );
         ss << ")";
     }
@@ -120,11 +129,18 @@ struct ExprTreePrintingVisitor : public boost::static_visitor<void> {
     void operator()( const typename Tree::template BinaryOperator<OR_> & bo ) {
         ss << "(";
         boost::apply_visitor( *this, bo.l.root );
-        ss << " & ";
+        ss << " or ";
         boost::apply_visitor( *this, bo.r.root );
         ss << ")";
     }
 };
+
+template<typename LeafT>
+std::ostream & operator<<(std::ostream & ss, ExpressionTree<LeafT> ast) {
+    ExprTreePrintingVisitor<LeafT> astp(ss);
+    boost::apply_visitor( astp, ast.root );
+    return ss;
+}
 
 /// Condition evaluator recursive visitor struct.
 template< typename LeafT >
@@ -161,12 +177,6 @@ struct ExpressionEvaluationVisitor : public boost::static_visitor<typename LeafT
 /// (expressions in "<label> : <expr>" pairs).
 typedef ExpressionTree<std::pair<Predicate, std::string> > AST;
 
-std::ostream & operator<<(std::ostream & ss, AST ast) {
-    ExprTreePrintingVisitor<typename AST::Leaf> astp(ss);
-    boost::apply_visitor( astp, ast.root );
-    return ss;
-}
-
 // Filtering traits
 //////////////////
 
@@ -175,7 +185,14 @@ template<typename SubjectT>
 struct Traits {
     typedef SubjectT Subject;
     /// Abstract base for filter objects.
-    struct Base { virtual bool check( Subject ) const = 0; };
+    struct Base {
+        virtual void dump( std::ostream & ) const = 0;
+        virtual bool eval( Subject ) const = 0;
+        friend std::ostream & operator<<( std::ostream & os, const Base & me ) {
+            me.dump( os );
+            return os;
+        }
+    };
 
     typedef std::shared_ptr<Base> NodeRef;
 
@@ -217,13 +234,18 @@ struct Traits {
     public:
         Parameterized( DecisionTree dt_ ) : dt(dt_) {}
         /// Evaluates expression.
-        bool check( Subject s ) const override {
+        bool eval( Subject s ) const override {
             ExpressionEvaluationVisitor<Leaf> v(compute( s ));
             //return boost::apply_visitor(v, dt.root);
             return v(dt.root);
         }
         /// Must compute value from given subject instance.
         virtual Value compute( Subject s ) const = 0;
+
+        void dump(std::ostream & ss) const override {
+            filtering::ExprTreePrintingVisitor<Leaf> pv( ss );
+            boost::apply_visitor( pv, dt.root );
+        }
     };
 
     /// Filter construction callback.
@@ -246,6 +268,14 @@ private:
     /// Known constructors.
     static std::unordered_map<std::string, FilterConstructor> * _constructors;
 };  // struct Traits
+
+
+//template<typename SubjectT>
+//struct LeafEvalTraits< std::shared_ptr<typename Traits<SubjectT>::Base> > {
+//    // ...
+//};
+
+// ctring (TODO: move to dedicated scope, since complex logic may be involved)
 
 template<typename T>
 std::unordered_map<std::string, typename Traits<T>::FilterConstructor>
@@ -292,7 +322,9 @@ Traits<T>::produce( const std::string name
                << name << "\" instance w/ parameters: "
                << ast << std::endl;
     }
-    return Traits<T>::construct(ctr, ast);
+    auto r = Traits<T>::construct(ctr, ast);
+    assert(r);  // constructor returned NULL ptr
+    return r;
 }
 
 // Comparison traits
@@ -405,16 +437,16 @@ struct CtxFilter : qi::grammar< ItT
         using qi::_val;
         using qi::lexeme;
         using boost::spirit::ascii::alpha;
-        typedef filtering::Traits<T> FT;
 
         filters =
             filter[_val = qi::_1]
-            >> -( ( lit("&&") >> filter )[ _val |= qi::_1 ]
+            >> *( ( lit("&&") >> filter )[ _val &= qi::_1 ]
                 | ( lit("||") >> filter )[ _val |= qi::_1 ]
                 )
             ;
 
-        filter = (label >> char_(':') >> expressions)[phx::bind(&FT::produce, qi::_1, qi::_3, logStr)]
+        filter = (label >> char_(':') >> expressions)[_val = filter_vctr(qi::_1, qi::_3)]
+            | (char_('(') >> filters >> ')')[_val = qi::_2]
             ;
 
         expressions = expression[_val = qi::_1]
@@ -438,7 +470,7 @@ struct CtxFilter : qi::grammar< ItT
             ;
 
         label %= (qi::alpha | qi::char_( "_" ))
-                >> *(qi::alnum | qi::char_( "_" ))
+                >> *(qi::alnum | qi::char_( "_" ) | qi::char_( "." ))
             ;
 
         BOOST_SPIRIT_DEBUG_NODE(filters);
@@ -455,11 +487,7 @@ struct CtxFilter : qi::grammar< ItT
     qi::rule< ItT
             , typename filtering::Traits<T>::Tree
             , ascii::space_type
-            > filters;
-    qi::rule< ItT
-            , typename filtering::Traits<T>::NodeRef
-            , ascii::space_type
-            > filter;
+            > filter, filters;
     qi::rule< ItT
             , filtering::AST()
             , ascii::space_type> expression, expressions;
@@ -469,6 +497,25 @@ struct CtxFilter : qi::grammar< ItT
 
     qi::rule<ItT, std::string(), ascii::space_type> label
                                                   , ctrParameter;
+
+public:
+    struct FilterVCtrImpl {
+        typedef std::shared_ptr<typename filtering::Traits<T>::Base> ResHandle;
+
+        template<typename Sig> struct result;
+
+        template<typename This, typename A0, typename A1>
+        struct result< This(A0, A1) > {
+            typedef ResHandle type;
+        };
+
+        ResHandle operator()( std::string name
+                                                        , filtering::AST ast ) const {
+            return ResHandle(filtering::Traits<T>::produce( name, ast, nullptr ));
+        }
+    };
+
+
 private:
     struct Predicate_ : qi::symbols<char, filtering::Predicate> {
         Predicate_() {
@@ -481,6 +528,8 @@ private:
                      ;
         }
     } predicate_;
+
+    boost::phoenix::function<FilterVCtrImpl> filter_vctr;
 };
 
 }  // namespace client
@@ -489,7 +538,7 @@ namespace filtering {
 template<> void
 LeafPrintingTraits< typename AST::Leaf >::print_leaf( const typename AST::Leaf & p
                                                     , std::ostream & ss ) {
-    ss << "(";
+    ss << "[";
     switch( p.first ) {
         case unset : ss << '0' ; break;
         case eq    : ss << '=' ; break;
@@ -501,9 +550,18 @@ LeafPrintingTraits< typename AST::Leaf >::print_leaf( const typename AST::Leaf &
         default: ss << '?'; break;
     };
     ss << ", \"" << p.second
-       << "\")";
+       << "\"]";
 }
 
+template<typename T>
+struct LeafPrintingTraits< std::shared_ptr<T> > {
+    static void print_leaf(
+            const std::shared_ptr<T> & p
+          , std::ostream & ss ) {
+        const T & obj = *p;
+        ss << obj;
+    }
+};
 }  // namespace filtering
 
 // ////////////////////// ////////////////////// //////////////////////// /////
@@ -533,14 +591,6 @@ AComparator::vctr( const filtering::AST & ast ) {
         , decltype(filtering::ComparisonTraits<int>::parse<SomeContext>) *>
         cv(filtering::ComparisonTraits<int>::parse<SomeContext>);
     auto dt = boost::apply_visitor( cv, ast.root );
-    {
-        filtering::ExprTreePrintingVisitor<
-                typename filtering::Traits<SomeContext>::template Parameterized<int>::Leaf  // Parent::Leaf
-                >
-            pv( std::cout );  // XXX
-        boost::apply_visitor( pv, dt );  // XXX
-        std::cout << std::endl;
-    }
     return new AComparator( dt );
 }
 
@@ -569,6 +619,18 @@ BComparator::vctr( const filtering::AST & ast ) {
     return new BComparator( dt );
 }
 
+SomeContext testingSamples[] = {
+        {   0,   0 },
+        {   1,   0 },
+        { 100,   0 },
+        {   0,   1 },
+        {   0, 100 },
+        {   1,   1 },
+        {   1, 100 },
+        { 100,   1 },
+        { 100, 100 },
+    };
+
 int
 main( int argc, char * const argv[] ) {
     filtering::Traits<SomeContext>::register_constructor("a", AComparator::vctr);
@@ -578,18 +640,34 @@ main( int argc, char * const argv[] ) {
 
     client::CtxFilter< std::string::const_iterator
                      , SomeContext> ctxFilter( &std::cout );
+    filtering::Traits<SomeContext>::Tree filter;
 
     std::string str;
     while (std::getline(std::cin, str)) {
-        if (str.empty() || str[0] == 'q' || str[0] == 'Q')
+        if( str.empty() || str[0] == 'q' || str[0] == 'Q' ) {
             break;
+        }
 
         std::string::const_iterator iter = str.begin();
         std::string::const_iterator end = str.end();
-        bool r = phrase_parse(iter, end, ctxFilter, boost::spirit::ascii::space);
+        bool r = phrase_parse(iter, end
+                             , ctxFilter
+                             , boost::spirit::ascii::space
+                             , filter );
 
         if( r && end == iter ) {
-            std::cout << "ok." << std::endl;
+            std::cout << "ok: " << filter << std::endl;
+            for( size_t i = 0
+               ; i < sizeof(testingSamples)/sizeof(SomeContext)
+               ; ++i ) {
+                std::cout << "samle #" << i << ": ";
+                //if( filtering::EvaluationTraits<SomeContext>::eval(filter, testingSamples[i]) ) {
+                //    std::cout << "passed";
+                //} else {
+                //    std::cout << "denied";
+                //}
+                std::cout << std::endl;
+            }
         } else {
             std::string rest(iter, end);
             std::cerr << "Failed. Stopped at: \": "
