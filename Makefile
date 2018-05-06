@@ -1,7 +1,10 @@
-a.out: spd-filters-bsp-2.cpp
-	g++ -g -Wall -std=gnu++14 spd-filters-bsp-2.cpp
+all: test-uc-dsl
+
+test-uc-dsl: test-uc-dsl.cpp
+	g++ -c -g -Wall -std=gnu++14 $^ -o $@
 
 clean:
-	rm -rf a.out
+	rm -rf uc-dsl-test
 
-.PHONY: clean
+
+.PHONY: clean all
